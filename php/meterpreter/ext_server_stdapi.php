@@ -1434,8 +1434,8 @@ function channel_create_stdapi_fs_file($req, &$pkt) {
 
 if (!function_exists('packet_add_tlv_local_addrinfo')) {
 function packet_add_tlv_local_addrinfo(&$pkt, $sock) {
-    switch (get_resource_type($sock)) {
-    case 'Socket':
+    switch (get_rtype($sock)) {
+    case 'socket':
         $local_host = '';
         $local_port = 0;
         socket_getsockname($sock, $local_host, $local_port);
@@ -1494,6 +1494,68 @@ function channel_create_stdapi_net_tcp_client($req, &$pkt) {
     #
 
     $id = register_channel($sock);
+    packet_add_tlv($pkt, create_tlv(TLV_TYPE_CHANNEL_ID, $id));
+    packet_add_tlv_local_addrinfo($pkt, $sock);
+    add_reader($sock);
+    return ERROR_SUCCESS;
+}
+}
+
+if (!function_exists('channel_create_stdapi_net_tcp_server')) {
+function channel_create_stdapi_net_tcp_server($req, &$pkt) {
+    $local_host_tlv = packet_get_tlv($req, TLV_TYPE_LOCAL_HOST);
+    $local_port_tlv = packet_get_tlv($req, TLV_TYPE_LOCAL_PORT);
+    
+    $local_host = $local_host_tlv ? $local_host_tlv['value'] : '';
+    $local_port = $local_port_tlv['value'];
+    
+    $sock = false;
+    
+    #stream_socket_server
+    if (can_call_function('stream_socket_server')) {
+        $bind_addr = $local_host;
+        if (empty($bind_addr)) {
+            $bind_addr = '0.0.0.0';
+        }
+        $sock = @stream_socket_server("tcp://{$bind_addr}:{$local_port}", $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+        if ($sock) {
+            register_stream($sock);
+        }
+    } elseif (can_call_function('socket_create')) {
+        # fallback 
+        if (empty($local_host) || $local_host == '0.0.0.0') {
+            $ipf = WIN_AF_INET;
+            $bind_addr = '0.0.0.0';
+        } elseif ($local_host == '::' || strpos($local_host, ':') !== false) {
+            $ipf = WIN_AF_INET6;
+            $bind_addr = $local_host == '::' ? '::' : $local_host;
+        } else {
+            $ipf = WIN_AF_INET;
+            $bind_addr = $local_host;
+        }
+        
+        $sock = socket_create($ipf, SOCK_STREAM, SOL_TCP);
+        if ($sock) {
+            socket_set_option($sock, SOL_SOCKET, SO_REUSEADDR, 1);
+            if (@socket_bind($sock, $bind_addr, $local_port)) {
+                if (@socket_listen($sock, 128)) {
+                    register_socket($sock);
+                } else {
+                    socket_close($sock);
+                    $sock = false;
+                }
+            } else {
+                socket_close($sock);
+                $sock = false;
+            }
+        }
+    }
+    
+    if (!$sock) {
+        return ERROR_CONNECTION_ERROR;
+    }
+    
+    $id = register_channel($sock, null, null, 'tcp_server');
     packet_add_tlv($pkt, create_tlv(TLV_TYPE_CHANNEL_ID, $id));
     packet_add_tlv_local_addrinfo($pkt, $sock);
     add_reader($sock);

@@ -201,6 +201,7 @@ define("TLV_TYPE_CHANNEL_TYPE",        TLV_META_TYPE_STRING |  51);
 define("TLV_TYPE_CHANNEL_DATA",        TLV_META_TYPE_RAW    |  52);
 define("TLV_TYPE_CHANNEL_DATA_GROUP",  TLV_META_TYPE_GROUP  |  53);
 define("TLV_TYPE_CHANNEL_CLASS",       TLV_META_TYPE_UINT   |  54);
+define("TLV_TYPE_CHANNEL_PARENTID",    TLV_META_TYPE_UINT   |  55);
 
 define("TLV_TYPE_SEEK_WHENCE",         TLV_META_TYPE_UINT   |  70);
 define("TLV_TYPE_SEEK_OFFSET",         TLV_META_TYPE_UINT   |  71);
@@ -704,11 +705,11 @@ if (!function_exists('core_machine_id')) {
 }
 $channels = array();
 
-function register_channel($in, $out=null, $err=null) {
+function register_channel($in, $out=null, $err=null, $subtype=null) {
   global $channels;
   if ($out == null) { $out = $in; }
   if ($err == null) { $err = $out; }
-  $channels[] = array(0 => $in, 1 => $out, 2 => $err, 'type' => get_rtype($in), 'data' => '');
+  $channels[] = array(0 => $in, 1 => $out, 2 => $err, 'type' => get_rtype($in), 'subtype' => $subtype, 'data' => '');
 
   # Grab the last index and use it as the new ID.
   $id = end(array_keys($channels));
@@ -1566,14 +1567,90 @@ while (false !== ($cnt = select($r, $w, $e, $t))) {
       write_tlv_to_socket($msgsock, $response);
     } else {
       #my_print("not Msgsock: $ready");
-      $data = read($ready);
-      if (false === $data) {
-        handle_dead_resource_channel($ready);
-      } elseif (strlen($data) > 0){
-        my_print(sprintf("Read returned %s bytes", strlen($data)));
-        $request = handle_resource_read_channel($ready, $data);
-        if ($request) {
-          write_tlv_to_socket($msgsock, $request);
+      
+      # Check if this is a TCP server channel with an incoming connection
+      $chan_id = get_channel_id_from_resource($ready);
+      $channel = false;
+      if ($chan_id !== false) {
+        $channel = get_channel_by_id($chan_id);
+      }
+      
+      if ($channel && isset($channel['subtype']) && $channel['subtype'] == 'tcp_server') {
+        $client_sock = false;
+        $client_addr = '';
+        $client_port = 0;
+        
+        switch (get_rtype($ready)) {
+          case 'socket':
+            $client_sock = @socket_accept($ready);
+            if ($client_sock) {
+              socket_getpeername($client_sock, $client_addr, $client_port);
+              register_socket($client_sock);
+            }
+            break;
+          case 'stream':
+            $client_sock = @stream_socket_accept($ready, 0, $peer_name);
+            if ($client_sock) {
+              if (preg_match('/^\[([^\]]+)\]:(\d+)$/', $peer_name, $matches)) {
+                # IPv6 with brackets
+                $client_addr = $matches[1];
+                $client_port = (int)$matches[2];
+              } elseif (preg_match('/^([^:]+):(\d+)$/', $peer_name, $matches)) {
+                # IPv4
+                $client_addr = $matches[1];
+                $client_port = (int)$matches[2];
+              }
+              register_stream($client_sock);
+            }
+            break;
+        }
+        
+        if ($client_sock) {
+          $server_addr = '';
+          $server_port = 0;
+          switch (get_rtype($ready)) {
+            case 'socket':
+              socket_getsockname($ready, $server_addr, $server_port);
+              break;
+            case 'stream':
+              $local_name = stream_socket_get_name($ready, false);
+              if (preg_match('/^\[([^\]]+)\]:(\d+)$/', $local_name, $matches)) {
+                $server_addr = $matches[1];
+                $server_port = (int)$matches[2];
+              } elseif (preg_match('/^([^:]+):(\d+)$/', $local_name, $matches)) {
+                $server_addr = $matches[1];
+                $server_port = (int)$matches[2];
+              }
+              break;
+          }
+          
+          $client_channel_id = register_channel($client_sock);
+          add_reader($client_sock);
+          
+          $pkt = pack("N", PACKET_TYPE_REQUEST);
+          packet_add_tlv($pkt, create_tlv(TLV_TYPE_COMMAND_ID, COMMAND_ID_STDAPI_NET_TCP_CHANNEL_OPEN));
+          packet_add_tlv($pkt, create_tlv(TLV_TYPE_REQUEST_ID, generate_req_id()));
+          packet_add_tlv($pkt, create_tlv(TLV_TYPE_CHANNEL_ID, $client_channel_id));
+          packet_add_tlv($pkt, create_tlv(TLV_TYPE_CHANNEL_PARENTID, $chan_id));
+          packet_add_tlv($pkt, create_tlv(TLV_TYPE_LOCAL_HOST, $server_addr));
+          packet_add_tlv($pkt, create_tlv(TLV_TYPE_LOCAL_PORT, $server_port));
+          packet_add_tlv($pkt, create_tlv(TLV_TYPE_PEER_HOST, $client_addr));
+          packet_add_tlv($pkt, create_tlv(TLV_TYPE_PEER_PORT, $client_port));
+          packet_add_tlv($pkt, create_tlv(TLV_TYPE_UUID, $GLOBALS['UUID']));
+          
+          $pkt = pack("N", strlen($pkt) + 4) . $pkt;
+          write_tlv_to_socket($msgsock, $pkt);
+        }
+      } else {
+        $data = read($ready);
+        if (false === $data) {
+          handle_dead_resource_channel($ready);
+        } elseif (strlen($data) > 0){
+          my_print(sprintf("Read returned %s bytes", strlen($data)));
+          $request = handle_resource_read_channel($ready, $data);
+          if ($request) {
+            write_tlv_to_socket($msgsock, $request);
+          }
         }
       }
     }
